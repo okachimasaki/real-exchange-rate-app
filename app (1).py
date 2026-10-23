@@ -167,12 +167,77 @@ def fetch_country_list() -> dict[str, str]:
             if not name and c.get("names"):
                 name = c["names"].get("en")
             out[c["id"]] = name or c["id"]
-        out.setdefault(EURO_AREA, "Euro Area")
+        # The IMF codelist can also contain non-country/aggregate codes such as
+        # "EUR" that have no CPI/ER series. The Euro area must use G163.
+        for bad in ("EUR", "EMU", "EA", "EA19", "EA20", "U2"):
+            out.pop(bad, None)
+        out[EURO_AREA] = "Euro Area"
+        # keep ISO3-style country codes plus the Euro area
+        out = {k: v for k, v in out.items()
+               if k == EURO_AREA or (len(k) == 3 and k.isalpha())}
         if len(out) > 20:
             return out
     except Exception:
         pass
     return dict(FALLBACK_COUNTRIES)
+
+
+def _codes_from_availability(js: dict) -> set[str]:
+    """Extract country codes from an SDMX 3.0 availability response."""
+    data = js.get("data", js)
+    out: set[str] = set()
+    for con in data.get("dataConstraints", []) or []:
+        for reg in con.get("cubeRegions", []) or []:
+            for kv in (reg.get("keyValues") or reg.get("components") or []):
+                if kv.get("id") in ("COUNTRY", "REF_AREA"):
+                    for v in kv.get("values", []):
+                        out.add(v if isinstance(v, str) else v.get("value", ""))
+    return {c for c in out if c}
+
+
+def _codes_from_csv(text: str) -> set[str]:
+    df = pd.read_csv(io.StringIO(text), usecols=lambda c: c.upper() in
+                     ("COUNTRY", "REF_AREA", "OBS_VALUE"))
+    col = next(c for c in df.columns if c.upper() in ("COUNTRY", "REF_AREA"))
+    df = df.dropna(subset=[c for c in df.columns if c.upper() == "OBS_VALUE"])
+    return set(df[col].astype(str))
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def available_codes(agency: str, flow: str, key_template: str) -> set[str]:
+    """Countries for which the IMF actually publishes this monthly series."""
+    key = key_template.format(iso="*")
+    # 1) availability endpoint (fast, metadata only)
+    try:
+        r = requests.get(f"{IMF_BASE}/availability/dataflow/{agency}/{flow}/+/{key}",
+                         timeout=TIMEOUT, headers={**HEADERS_BASE, "Accept": "application/json"})
+        r.raise_for_status()
+        codes = _codes_from_availability(r.json())
+        if codes:
+            return codes
+    except Exception:
+        pass
+    # 2) fallback: wildcard data query, last few observations only
+    try:
+        r = requests.get(f"{IMF_BASE}/data/dataflow/{agency}/{flow}/+/{key}",
+                         params={"lastNObservations": 1}, timeout=TIMEOUT,
+                         headers={**HEADERS_BASE,
+                                  "Accept": "application/vnd.sdmx.data+csv;version=2.0.0"})
+        r.raise_for_status()
+        return _codes_from_csv(r.text)
+    except Exception:
+        return set()
+
+
+def applicable_countries() -> dict[str, str]:
+    """{code: name} for countries with BOTH monthly CPI and an exchange rate."""
+    names = fetch_country_list()
+    cpi = available_codes(*CPI_FLOW, CPI_KEY)
+    er = available_codes(*ER_FLOW, ER_KEY) | {"USA"}  # USD per USD = 1
+    both = cpi & er
+    if not both:            # availability lookup failed: use the full list
+        return names
+    return {c: names.get(c, c) for c in both}
 
 
 def get_cpi(iso: str) -> pd.Series:
@@ -221,7 +286,8 @@ st.title("Real Exchange Rate Explorer (IMF data)")
 st.caption("RER(t) = S(t) × P1(t) / P2(t), where S(t) = Country 2 currency per "
            "1 unit of Country 1 currency. Source: IMF SDMX 3.0 API (CPI, ER).")
 
-countries = fetch_country_list()
+with st.spinner("Loading the list of countries with IMF CPI and exchange-rate data…"):
+    countries = applicable_countries()
 iso_list = sorted(countries, key=lambda k: (k != EURO_AREA, countries[k]))
 label = lambda k: f"{countries[k]} ({k})"
 
@@ -234,6 +300,8 @@ with st.sidebar:
                       index=iso_list.index("JPN") if "JPN" in iso_list else 1,
                       format_func=label)
     view = st.radio("Chart", ["Real", "Nominal", "Both"], index=2)
+    st.caption(f"{len(countries)} countries/currency areas with both monthly "
+               "CPI and exchange-rate data in the IMF database.")
 
 if c1 == c2:
     st.warning("Please choose two different countries.")
@@ -258,7 +326,8 @@ for col, name in [("E1_LCU_per_USD", f"{c1} exchange rate"),
 missing = [r["series"] for r in cov if r["observations"] == 0]
 if missing:
     st.error("No IMF data found for: " + ", ".join(missing) +
-             ". Try another country pair.")
+             ". The IMF may not publish this series for the selected code. "
+             "Try another country pair (for the Euro area, choose 'Euro Area (G163)').")
     with st.expander("Data coverage"):
         st.dataframe(pd.DataFrame(cov), hide_index=True)
     st.stop()
