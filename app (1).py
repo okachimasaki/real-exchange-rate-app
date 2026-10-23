@@ -243,7 +243,22 @@ def applicable_countries() -> dict[str, str]:
 
 
 def get_cpi(iso: str) -> pd.Series:
-    return fetch_series(*CPI_FLOW, CPI_KEY.format(iso=iso))
+    s = fetch_series(*CPI_FLOW, CPI_KEY.format(iso=iso))
+    if not s.empty:
+        return s
+    # Fallbacks: the Euro area (and some EU members) publish the HICP
+    # (Harmonised Index of Consumer Prices) instead of a national CPI.
+    for key in (f"{iso}.HICP._T.IX.M", f"{iso}.*._T.IX.M"):
+        try:
+            s = fetch_series(*CPI_FLOW, key)
+        except Exception:
+            continue
+        if not s.empty:
+            st.session_state[f"cpi_note_{iso}"] = (
+                f"{iso}: national CPI not available; using IMF series {key} "
+                "(HICP for the Euro area).")
+            return s
+    return s
 
 
 def get_lcu_per_usd(iso: str) -> pd.Series:
@@ -339,6 +354,9 @@ for col, name in [("E1_LCU_per_USD", f"{c1} exchange rate"),
                 "last": s.index.max().strftime("%Y-%m") if len(s) else "—"})
 if EURO_AREA in (c1, c2) and st.session_state.get("euro_er_note"):
     st.caption(st.session_state["euro_er_note"])
+for _c in (c1, c2):
+    if st.session_state.get(f"cpi_note_{_c}"):
+        st.caption(st.session_state[f"cpi_note_{_c}"])
 missing = [r["series"] for r in cov if r["observations"] == 0]
 if missing:
     st.error("No IMF data found for: " + ", ".join(missing) +
