@@ -237,7 +237,9 @@ def applicable_countries() -> dict[str, str]:
     both = cpi & er
     if not both:            # availability lookup failed: use the full list
         return names
-    return {c: names.get(c, c) for c in both}
+    out = {c: names.get(c, c) for c in both}
+    out[EURO_AREA] = "Euro Area"   # always offer the Euro area (required)
+    return out
 
 
 def get_cpi(iso: str) -> pd.Series:
@@ -249,7 +251,19 @@ def get_lcu_per_usd(iso: str) -> pd.Series:
     if iso == "USA":
         idx = pd.date_range(START_PERIOD, pd.Timestamp.today(), freq="MS")
         return pd.Series(1.0, index=idx)
-    return fetch_series(*ER_FLOW, ER_KEY.format(iso=iso))
+    s = fetch_series(*ER_FLOW, ER_KEY.format(iso=iso))
+    if s.empty and iso == EURO_AREA:
+        # Fallback: since 1999 euro-area members report in euros, so a large
+        # member's EUR-per-USD rate equals the Euro area rate.
+        for member in ("DEU", "FRA"):
+            m = fetch_series(*ER_FLOW, ER_KEY.format(iso=member))
+            m = m[m.index >= pd.Timestamp("1999-01")]
+            if not m.empty:
+                st.session_state["euro_er_note"] = (
+                    f"Euro area exchange rate not published under G163; using "
+                    f"{member} EUR per USD from 1999-01 (identical after euro adoption).")
+                return m
+    return s
 
 
 # --------------------------------------------------------------------------
@@ -323,6 +337,8 @@ for col, name in [("E1_LCU_per_USD", f"{c1} exchange rate"),
     cov.append({"series": name, "observations": len(s),
                 "first": s.index.min().strftime("%Y-%m") if len(s) else "—",
                 "last": s.index.max().strftime("%Y-%m") if len(s) else "—"})
+if EURO_AREA in (c1, c2) and st.session_state.get("euro_er_note"):
+    st.caption(st.session_state["euro_er_note"])
 missing = [r["series"] for r in cov if r["observations"] == 0]
 if missing:
     st.error("No IMF data found for: " + ", ".join(missing) +
